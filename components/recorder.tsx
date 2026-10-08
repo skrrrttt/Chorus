@@ -15,6 +15,7 @@ import {
   pickRecordingMime,
 } from "@/lib/audio";
 import type { Chorus } from "@/lib/chorus";
+import { startRecording as startSession, type RecordingSession } from "@/lib/recording";
 import { submitClip } from "@/lib/upload";
 
 const MAX_SECONDS = 120;
@@ -30,6 +31,7 @@ type Phase =
   | "idle"
   | "arming"
   | "recording"
+  | "stopping"
   | "review"
   | "uploading"
   | "done"
@@ -50,8 +52,7 @@ export function Recorder({ chorus }: { chorus: Chorus }) {
   } | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
+  const sessionRef = useRef<RecordingSession | null>(null);
   const holdingRef = useRef(false);
   const startedAtRef = useRef(0);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -88,10 +89,38 @@ export function Recorder({ chorus }: { chorus: Chorus }) {
     };
   }, [clip]);
 
-  const stopRecording = useCallback(() => {
-    const rec = recorderRef.current;
-    if (rec && rec.state !== "inactive") rec.stop();
-  }, []);
+  // Leaves the recording screen right away, then waits for the audio. The
+  // session resolves even if the browser never confirms the stop, which iOS
+  // Safari sometimes fails to do.
+  const stopRecording = useCallback(async () => {
+    const session = sessionRef.current;
+    if (!session || phaseRef.current !== "recording") return;
+    sessionRef.current = null;
+    phaseRef.current = "stopping";
+    setPhase("stopping");
+    if (tickRef.current) clearInterval(tickRef.current);
+    tickRef.current = null;
+
+    const { blob, mime, seconds, clean } = await session.stop();
+    if (!clean) {
+      // The tracks were cut to unstick the recorder; start fresh next time.
+      releaseMic();
+    }
+
+    if (seconds < MIN_SECONDS || blob.size === 0) {
+      setHint(
+        clean
+          ? "That was quick. Hold the button while you talk, then let go."
+          : "We didn't catch that. Hold the button and try again.",
+      );
+      setPhase("idle");
+      return;
+    }
+
+    setClip({ blob, url: URL.createObjectURL(blob), mime, seconds });
+    setHint(null);
+    setPhase("review");
+  }, [releaseMic]);
 
   const startRecording = useCallback(() => {
     const stream = streamRef.current;
@@ -107,43 +136,21 @@ export function Recorder({ chorus }: { chorus: Chorus }) {
       rec = new MediaRecorder(stream);
     }
 
-    chunksRef.current = [];
-    rec.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-    };
-    rec.onstop = () => {
-      if (tickRef.current) clearInterval(tickRef.current);
-      tickRef.current = null;
-
-      const seconds = (Date.now() - startedAtRef.current) / 1000;
-      const type =
-        rec.mimeType || mime || chunksRef.current[0]?.type || "audio/webm";
-      const blob = new Blob(chunksRef.current, { type });
-      chunksRef.current = [];
-      recorderRef.current = null;
-
-      if (seconds < MIN_SECONDS || blob.size === 0) {
-        setHint("That was quick. Hold the button while you talk, then let go.");
-        setPhase("idle");
-        return;
-      }
-
-      setClip({ blob, url: URL.createObjectURL(blob), mime: type, seconds });
-      setHint(null);
-      setPhase("review");
-    };
-
-    recorderRef.current = rec;
     startedAtRef.current = Date.now();
     setElapsed(0);
     setHint(null);
+    phaseRef.current = "recording";
     setPhase("recording");
-    rec.start();
+    sessionRef.current = startSession(
+      rec,
+      stream.getTracks(),
+      mime ?? "audio/webm",
+    );
 
     tickRef.current = setInterval(() => {
       const s = (Date.now() - startedAtRef.current) / 1000;
       setElapsed(s);
-      if (s >= MAX_SECONDS) stopRecording();
+      if (s >= MAX_SECONDS) void stopRecording();
     }, 200);
   }, [stopRecording]);
 
@@ -153,7 +160,7 @@ export function Recorder({ chorus }: { chorus: Chorus }) {
     // A tap while recording stops it. Covers the case where the release event
     // never arrived (a permission sheet or a phone call got in the way).
     if (phaseRef.current === "recording") {
-      stopRecording();
+      void stopRecording();
       holdingRef.current = false;
       return;
     }
@@ -182,7 +189,7 @@ export function Recorder({ chorus }: { chorus: Chorus }) {
 
   const endHold = useCallback(() => {
     holdingRef.current = false;
-    if (phaseRef.current === "recording") stopRecording();
+    if (phaseRef.current === "recording") void stopRecording();
   }, [stopRecording]);
 
   // If the page goes away mid-recording (call, lock screen), stop cleanly.
@@ -334,9 +341,10 @@ export function Recorder({ chorus }: { chorus: Chorus }) {
     );
   }
 
-  // idle / arming / recording
+  // idle / arming / recording / stopping
   const recording = phase === "recording";
   const arming = phase === "arming";
+  const stopping = phase === "stopping";
 
   return (
     <Shell chorus={chorus} intro>
@@ -375,14 +383,14 @@ export function Recorder({ chorus }: { chorus: Chorus }) {
             type="button"
             aria-label={recording ? "Recording. Let go to stop." : "Hold to record"}
             aria-pressed={recording}
-            disabled={arming}
+            disabled={arming || stopping}
             className={[
               "hold-target relative flex h-[132px] w-[132px] items-center justify-center rounded-full",
               "transition-transform duration-150 focus:outline-none focus-visible:ring-4 focus-visible:ring-accent/50",
               recording
                 ? "scale-95 bg-record text-ink"
                 : "bg-accent text-on-accent active:scale-95",
-              arming ? "opacity-70" : "",
+              arming || stopping ? "opacity-70" : "",
             ].join(" ")}
             onPointerDown={(e) => {
               e.preventDefault();
@@ -413,9 +421,11 @@ export function Recorder({ chorus }: { chorus: Chorus }) {
         <p className="mt-6 min-h-[3.25rem] text-center text-[17px] leading-snug text-ink-secondary">
           {recording
             ? "Let go when you're done."
-            : arming
-              ? "Turning on the microphone…"
-              : hint ?? "Hold the button and talk. Let go when you're done."}
+            : stopping
+              ? "One moment…"
+              : arming
+                ? "Turning on the microphone…"
+                : hint ?? "Hold the button and talk. Let go when you're done."}
         </p>
       </div>
     </Shell>
